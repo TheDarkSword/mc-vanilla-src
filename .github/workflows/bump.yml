@@ -1,0 +1,63 @@
+name: Bump Minecraft version
+
+on:
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency: bump
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Look for a newer NeoForm release
+        id: check
+        run: |
+          current=$(sed -n 's/^neoform_version=//p' gradle.properties)
+          # Releases only (e.g. 26.4-1): snapshots, pre-releases and release candidates are skipped.
+          latest=$(curl -fsSL https://maven.neoforged.net/releases/net/neoforged/neoform/maven-metadata.xml \
+            | sed -n 's|.*<version>\([0-9][0-9.]*-[0-9]*\)</version>.*|\1|p' | sort -V | tail -1)
+          echo "current=$current latest=$latest"
+          if [ -z "$latest" ] || [ "$(printf '%s\n' "$current" "$latest" | sort -V | tail -1)" = "$current" ]; then
+            echo "Up to date."
+            exit 0
+          fi
+          echo "current=$current" >> "$GITHUB_OUTPUT"
+          echo "latest=$latest" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@v6
+        if: steps.check.outputs.latest
+        with:
+          distribution: temurin
+          java-version: 25
+
+      - uses: gradle/actions/setup-gradle@v6
+        if: steps.check.outputs.latest
+
+      # Nothing is bumped unless the new version decompiles and recompiles. The output is never published.
+      - name: Smoke test
+        if: steps.check.outputs.latest
+        run: ./gradlew setup build -Pneoform_version=${{ steps.check.outputs.latest }}
+
+      - name: Freeze the old version in a branch and bump latest
+        if: steps.check.outputs.latest
+        env:
+          CURRENT: ${{ steps.check.outputs.current }}
+          LATEST: ${{ steps.check.outputs.latest }}
+        run: |
+          old_mc=${CURRENT%-*}
+          new_mc=${LATEST%-*}
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if [ "$old_mc" != "$new_mc" ] && ! git ls-remote --exit-code --heads origin "$old_mc" >/dev/null; then
+            git push origin "HEAD:refs/heads/$old_mc"
+          fi
+          sed -i "s/^neoform_version=.*/neoform_version=$LATEST/" gradle.properties
+          git commit -am "Bump to Minecraft $new_mc (NeoForm $LATEST)"
+          git push origin HEAD
