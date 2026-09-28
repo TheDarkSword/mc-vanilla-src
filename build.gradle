@@ -1,0 +1,222 @@
+import groovy.json.JsonSlurper
+
+plugins {
+    id 'java'
+}
+
+def neoformVersion = providers.gradleProperty('neoform_version').get()
+def mcVersion = neoformVersion.replaceFirst(/-\d+$/, '') // 26.3-1 -> 26.3
+def workDir = file("build/mc/$neoformVersion")
+def sourcesJar = file("$workDir/sources.jar")
+def assetsProps = file("$workDir/assets.properties")
+
+group = 'local.minecraft'
+version = mcVersion
+base.archivesName = 'minecraft'
+
+repositories {
+    maven { url = 'https://maven.neoforged.net/releases' }
+    maven {
+        url = 'https://libraries.minecraft.net'
+        metadataSources { mavenPom(); artifact() }
+    }
+    mavenCentral()
+}
+
+configurations {
+    nfrt
+    neoform
+}
+
+dependencies {
+    nfrt "net.neoforged:neoform-runtime:${providers.gradleProperty('nfrt_version').get()}:all"
+    neoform "net.neoforged:neoform:$neoformVersion@zip"
+}
+
+// Mojang's version JSON: libraries, main class and JVM args. Cached per version.
+def versionJson = file("build/mc/${mcVersion}.json")
+if (!versionJson.exists()) {
+    def manifest = new JsonSlurper().parse(URI.create('https://piston-meta.mojang.com/mc/game/version_manifest_v2.json').toURL())
+    def entry = manifest.versions.find { it.id == mcVersion }
+    if (!entry) throw new GradleException("Minecraft $mcVersion not found in Mojang's version manifest")
+    versionJson.parentFile.mkdirs()
+    versionJson.text = URI.create(entry.url).toURL().text
+}
+def mcMeta = new JsonSlurper().parse(versionJson)
+def neoformConfig = new JsonSlurper().parse(zipTree(configurations.neoform.singleFile).matching { include 'config.json' }.singleFile)
+
+def osName = System.getProperty('os.name').toLowerCase().with { it.contains('win') ? 'windows' : it.contains('mac') ? 'osx' : 'linux' }
+// Launcher rule semantics: no rules = allowed, otherwise the last matching rule wins. Arch/feature rules are ignored.
+def allowed = { entry ->
+    if (!(entry instanceof Map) || !entry.rules) return true
+    def ok = false
+    entry.rules.each { r -> if (!r.features && !r.os?.arch && (!r.os || r.os.name == osName)) ok = r.action == 'allow' }
+    ok
+}
+
+java.toolchain.languageVersion = JavaLanguageVersion.of(neoformConfig.java_target as int)
+
+dependencies {
+    mcMeta.libraries.findAll(allowed).each { implementation(it.name) { transitive = false } }
+    neoformConfig.libraries.joined.each { compileOnly(it) { transitive = false } }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.fork = true
+    options.forkOptions.memoryMaximumSize = '4g'
+    options.compilerArgs += ['-nowarn', '-Xlint:none']
+}
+
+// ---------------------------------------------------------------- NeoFormRuntime
+
+def nfrt = { JavaExec task, List<String> nfrtArgs ->
+    task.group = 'minecraft'
+    task.classpath = configurations.nfrt
+    task.mainClass = 'net.neoforged.neoform.runtime.cli.Main'
+    task.javaLauncher = javaToolchains.launcherFor(java.toolchain)
+    task.args(nfrtArgs + ['--no-emojis', '--no-color'])
+}
+
+tasks.register('decompile', JavaExec) {
+    description = "Decompiles Minecraft $mcVersion (client + server) into $sourcesJar"
+    nfrt(it, ['run', "--neoform=net.neoforged:neoform:$neoformVersion@zip", '--dist=joined',
+              "--write-result=gameSources:$sourcesJar"])
+    inputs.property('neoform', neoformVersion)
+    outputs.file(sourcesJar)
+    doFirst { workDir.mkdirs() }
+}
+
+tasks.register('downloadAssets', JavaExec) {
+    description = "Downloads the client assets (sounds, languages, ...) needed by runClient"
+    nfrt(it, ['download-assets', "--minecraft-version=$mcVersion", "--write-properties=$assetsProps"])
+    inputs.property('minecraft', mcVersion)
+    outputs.file(assetsProps)
+    doFirst { workDir.mkdirs() }
+}
+
+// ---------------------------------------------------------------- src/ git repository
+
+def srcDir = file('src')
+
+// Runs git inside src/. Returns [exitCode, output]; throws on failure unless check = false.
+def git = { List<String> gitArgs, boolean check = true ->
+    def proc = new ProcessBuilder((['git'] + gitArgs)*.toString()).directory(srcDir).redirectErrorStream(true).start()
+    def out = proc.inputStream.text.trim()
+    def code = proc.waitFor()
+    if (check && code != 0) throw new GradleException("git ${gitArgs.join(' ')} failed:\n$out")
+    [code, out]
+}
+// Vanilla commits are machine-made, so they get a fixed author and never depend on the user's git config.
+def gitCommitVanilla = { git(['-c', 'user.name=mc-vanilla-src', '-c', 'user.email=mc-vanilla-src@localhost',
+                              'commit', '-q', '-m', "Minecraft $mcVersion (NeoForm $neoformVersion)"]) }
+
+def extractSources = {
+    copy {
+        from(zipTree(sourcesJar)) { include '**/*.java' }
+        into "$srcDir/main/java"
+    }
+    copy {
+        from(zipTree(sourcesJar)) { exclude '**/*.java', 'META-INF/MANIFEST.MF' }
+        into "$srcDir/main/resources"
+    }
+    file("$srcDir/.mc-version").text = "$neoformVersion\n"
+}
+
+tasks.register('setup') {
+    group = 'minecraft'
+    description = "Creates src/ with the decompiled Minecraft $mcVersion code, as a git repository"
+    dependsOn 'decompile'
+    doLast {
+        if (srcDir.exists()) {
+            throw new GradleException("src/ already exists. Run 'updateSources' to move it to $mcVersion, or delete src/ to start over.")
+        }
+        extractSources()
+        file("$srcDir/.gitattributes").text = '* text=auto eol=lf\n'
+        git(['init', '-q', '-b', 'vanilla'])
+        git(['add', '-A'])
+        gitCommitVanilla()
+        git(['checkout', '-q', '-b', 'main'])
+        logger.lifecycle("src/ is ready: Minecraft $mcVersion on branch 'main' (pristine copy on branch 'vanilla').")
+    }
+}
+
+tasks.register('updateSources') {
+    group = 'minecraft'
+    description = "Moves src/ to Minecraft $mcVersion: freezes the old version in a branch, then merges the new code"
+    dependsOn 'decompile'
+    doLast {
+        if (!file("$srcDir/.git").exists()) throw new GradleException("src/ is not set up yet. Run 'setup' first.")
+        def old = git(['show', 'vanilla:.mc-version'])[1]
+        if (old == neoformVersion) {
+            logger.lifecycle("src/ is already on NeoForm $neoformVersion, nothing to do.")
+            return
+        }
+        if (git(['status', '--porcelain'])[1]) throw new GradleException('src/ has uncommitted changes. Commit or stash them first.')
+
+        def work = git(['rev-parse', '--abbrev-ref', 'HEAD'])[1]
+        def oldMc = old.replaceFirst(/-\d+$/, '')
+        if (oldMc != mcVersion) {
+            if (git(['rev-parse', '--verify', '-q', "refs/heads/$oldMc"], false)[0] == 0) {
+                logger.lifecycle("Branch '$oldMc' already exists, leaving it untouched.")
+            } else {
+                git(['branch', oldMc, work])
+                logger.lifecycle("Froze your Minecraft $oldMc code in branch '$oldMc'.")
+            }
+        }
+
+        git(['checkout', '-q', 'vanilla'])
+        git(['rm', '-r', '-q', '--ignore-unmatch', 'main'])
+        delete "$srcDir/main"
+        extractSources()
+        git(['add', '-A'])
+        gitCommitVanilla()
+        git(['checkout', '-q', work])
+
+        def (code, out) = git(['merge', '--no-edit', 'vanilla'], false)
+        if (code == 0) {
+            logger.lifecycle("Branch '$work' is now on Minecraft $mcVersion.")
+        } else {
+            logger.warn("""
+                |Merged Minecraft $mcVersion into '$work' with conflicts (your changes vs Mojang's):
+                |$out
+                |Fix them in src/, then run: git -C src add -A && git -C src commit
+                |To give up instead: git -C src merge --abort""".stripMargin())
+        }
+    }
+}
+
+// ---------------------------------------------------------------- run
+
+def mcJvmArgs = mcMeta.arguments.jvm.findAll(allowed)
+        .collectMany { it instanceof Map ? [it.value].flatten() : [it] }
+        .findAll { !it.contains('${') && it != '-cp' }
+
+tasks.register('runClient', JavaExec) {
+    group = 'minecraft'
+    description = 'Compiles src/ and starts the client (offline, username Dev)'
+    dependsOn 'downloadAssets'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = mcMeta.mainClass
+    workingDir = file('run/client')
+    jvmArgs(mcJvmArgs + ['-Xmx4G'])
+    doFirst {
+        workingDir.mkdirs()
+        def assets = new Properties()
+        assetsProps.withInputStream { assets.load(it) }
+        args '--version', mcVersion, '--gameDir', '.', '--accessToken', '0', '--username', 'Dev',
+             '--assetsDir', assets.assets_root, '--assetIndex', assets.asset_index
+    }
+}
+
+tasks.register('runServer', JavaExec) {
+    group = 'minecraft'
+    description = 'Compiles src/ and starts a dedicated server in run/server'
+    classpath = sourceSets.main.runtimeClasspath
+    mainClass = 'net.minecraft.server.Main'
+    workingDir = file('run/server')
+    jvmArgs(mcJvmArgs + ['-Xmx4G'])
+    standardInput = System.in
+    args 'nogui'
+    doFirst { workingDir.mkdirs() }
+}
